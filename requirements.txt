@@ -1,2 +1,4 @@
 psycopg[binary]>=3.1,<4
 python-dotenv>=1.0
+certifi>=2024.0
+psycopg-pool>=3.1

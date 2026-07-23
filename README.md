@@ -1,4 +1,4 @@
-# sl-agent-monitor
+# analyst-agent-monitor
 
 Operational monitoring dashboard for [`cg-sl-agent`](https://github.com/ClearGrid-Org/analyst-agent) — single-page web UI showing in-flight requests, recent runs, 24-hour metrics, per-user budget headroom, and a live log tail.
 
@@ -53,8 +53,8 @@ The helper auto-creates the table, runs a 30-second daemon thread that does an U
 ## Quick start
 
 ```bash
-git clone <repo-url> /opt/sl-agent-monitor
-cd /opt/sl-agent-monitor
+git clone <repo-url> /opt/analyst-agent-monitor
+cd /opt/analyst-agent-monitor
 
 python3 -m venv .venv
 source .venv/bin/activate
@@ -97,10 +97,10 @@ Runtime flags:
 ## Run as a service
 
 ```bash
-# Adjust paths in deploy/sl-agent-monitor.service first
+# Adjust paths in deploy/analyst-agent-monitor.service first
 # (WorkingDirectory, EnvironmentFile, ExecStart)
 make install-service
-sudo journalctl -u sl-agent-monitor -f
+sudo journalctl -u analyst-agent-monitor -f
 ```
 
 To remove:

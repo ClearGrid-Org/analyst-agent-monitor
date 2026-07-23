@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sl-agent-monitor — observability dashboard for cg-sl-agent.
+analyst-agent-monitor — observability dashboard for cg-sl-agent.
 
 Standalone web UI (no dependency on the agent's Python package). Reads the
 agent's Postgres and tails its log file. Three views + a drill-down:
@@ -311,7 +311,7 @@ def fetch_agent_status(log_path: Path) -> dict:
     t0 = time.monotonic()
     try:
         req = urllib.request.Request(AGENT_API_URL + "/health",
-                                     headers={"User-Agent": "sl-agent-monitor"})
+                                     headers={"User-Agent": "analyst-agent-monitor"})
         with urllib.request.urlopen(req, timeout=3, context=ssl_ctx) as resp:
             st["api_latency_ms"] = int((time.monotonic() - t0) * 1000)
             if resp.status == 200:

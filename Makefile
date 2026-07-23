@@ -16,14 +16,14 @@ run-public:     ## Launch on 0.0.0.0:$(PORT) — only behind a reverse proxy + a
 	python serve.py --host 0.0.0.0 --port $(PORT) --log-file $(LOG_FILE)
 
 install-service: ## Install the systemd unit (requires sudo).
-	sudo cp deploy/sl-agent-monitor.service /etc/systemd/system/
+	sudo cp deploy/analyst-agent-monitor.service /etc/systemd/system/
 	sudo systemctl daemon-reload
-	sudo systemctl enable --now sl-agent-monitor
-	sudo systemctl status sl-agent-monitor --no-pager
+	sudo systemctl enable --now analyst-agent-monitor
+	sudo systemctl status analyst-agent-monitor --no-pager
 
 uninstall-service: ## Stop and remove the systemd unit.
-	sudo systemctl disable --now sl-agent-monitor || true
-	sudo rm -f /etc/systemd/system/sl-agent-monitor.service
+	sudo systemctl disable --now analyst-agent-monitor || true
+	sudo rm -f /etc/systemd/system/analyst-agent-monitor.service
 	sudo systemctl daemon-reload
 
 test:           ## Quick smoke test — verify env vars + DB reachable.

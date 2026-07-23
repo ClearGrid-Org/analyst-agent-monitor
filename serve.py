@@ -196,7 +196,8 @@ def fetch_pulse() -> dict:
         """),
         downs=lambda: _rows(f"""
             select f.ts, f.user_name, f.reaction,
-                   left(coalesce(r.question, c.content, ''), 90) as question
+                   left(coalesce(r.question, c.content, ''), 90) as question,
+                   left(tf.content, 200)                          as comment
             from feedback f
             left join agent_runs r
                    on r.thread_ts = f.thread_ts
@@ -206,6 +207,14 @@ def fetch_pulse() -> dict:
                 where c.thread_ts = f.thread_ts and c.role = 'user'
                 order by c.seq desc limit 1
             ) c on true
+            left join lateral (
+                -- the written "what was wrong" arrives moments after the 👎
+                select content from text_feedback tf
+                where tf.thread_ts = f.thread_ts
+                  and tf.ts between f.ts - interval '3 minutes'
+                                and f.ts + interval '3 minutes'
+                order by tf.ts desc limit 1
+            ) tf on true
             where f.action = 'added' and f.reaction in {_FB_DOWN}
             order by f.ts desc limit 5
         """),
@@ -439,11 +448,19 @@ def fetch_run_detail(run_id: int) -> dict:
             select ts, user_name, reaction, action from feedback
             where thread_ts = %s order by ts
         """, (r["thread_ts"],))
+        # The written explanation lives in a separate table — it's the most
+        # valuable part of a 👎, so surface it alongside the reactions.
+        thunks["fb_text"] = lambda: _rows("""
+            select ts, user_name, feedback_type, content, related_question
+            from text_feedback
+            where thread_ts = %s order by ts
+        """, (r["thread_ts"],))
 
     res = _parallel(**thunks)
     get = lambda k: [] if isinstance(res.get(k, []), Exception) else res.get(k, [])
     return _jsonify({"run": r, "spans": get("spans"), "queries": get("queries"),
-                     "conversation": get("convo"), "feedback": get("fb")})
+                     "conversation": get("convo"), "feedback": get("fb"),
+                     "feedback_text": get("fb_text")})
 
 
 # ═══ QUALITY ═════════════════════════════════════════════════════════════
@@ -748,6 +765,11 @@ pre{background:var(--inset);border:1px solid var(--border);border-radius:var(--r
 .spark .d3{background:var(--err);border-radius:0 0 3px 3px}
 .spark .wk{font-size:10px;color:var(--dim);text-align:center;margin-top:4px}
 
+/* Written feedback — the "what was wrong" text a user typed with their 👎 */
+.fb-note{margin:8px 0 4px;padding:8px 12px;background:var(--inset);
+         border-left:2px solid var(--warn);border-radius:0 8px 8px 0}
+.fb-quote{color:var(--ink);font-style:italic;font-size:12.5px;margin-top:2px}
+
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
 }
@@ -841,7 +863,8 @@ async function renderPulse(){
       <div class="panel"><h2>Latest 👎 (7d)</h2><div class="bd">
         ${m.recent_downs.length? '<table>'+m.recent_downs.map(d=>
           `<tr><td class="muted">${ago(d.ts)}</td><td>${esc(d.user_name||'—')}</td>
-           <td>${esc(d.question||'(question unknown)')}</td></tr>`).join('')+'</table>'
+           <td>${esc(d.question||'(question unknown)')}
+               ${d.comment?`<div class="fb-quote">“${esc(d.comment)}”</div>`:''}</td></tr>`).join('')+'</table>'
         : '<div class="muted" style="text-align:center;padding:14px">No thumbs-down this week 🎉</div>'}
       </div></div>
     </div>
@@ -960,8 +983,14 @@ async function openRun(id){
       </div></div>
       <div class="panel"><h2>Feedback on this thread</h2><div class="bd">
         ${d.feedback.length?'<table>'+d.feedback.map(f=>
-          `<tr><td>${ago(f.ts)}</td><td>${esc(f.user_name||'—')}</td><td>:${esc(f.reaction)}: ${f.action}</td></tr>`).join('')+'</table>'
-        :'<div class="muted" style="padding:8px">none</div>'}
+          `<tr><td>${ago(f.ts)}</td><td>${esc(f.user_name||'—')}</td>
+           <td><span class="b ${/^(\+1|thumbsup)/.test(f.reaction)?'up2':'down'}">${/^(\+1|thumbsup)/.test(f.reaction)?'👍':'👎'}</span> ${f.action}</td></tr>`).join('')+'</table>'
+        :'<div class="muted" style="padding:8px">no reactions</div>'}
+        ${(d.feedback_text||[]).map(t=>`
+          <div class="fb-note">
+            <div class="muted" style="font-size:11px">${ago(t.ts)} · ${esc(t.user_name||'—')} · ${esc(t.feedback_type||'comment')}</div>
+            <div class="fb-quote">“${esc(t.content)}”</div>
+          </div>`).join('')}
       </div></div>
     </div>`;
   $('#detail').style.display='block';

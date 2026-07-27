@@ -4,18 +4,18 @@ After=network.target
 # If the monitor lives on the same VM as the agent, this lets systemd
 # defer startup until the agent is up. Comment out if you'd rather the
 # monitor stay up regardless of agent state.
-After=cg-sl-api.service
+After=cg-sl-agent-api.service
 
 [Service]
 # Adjust paths to match where you cloned the repo.
-WorkingDirectory=/opt/analyst-agent-monitor
-EnvironmentFile=/opt/analyst-agent-monitor/.env
+WorkingDirectory=/home/ubuntu/analyst-agent-monitor
+EnvironmentFile=/home/ubuntu/analyst-agent-monitor/.env
 # --log-file tails the API's log so the tail panel matches what the
 # status pill probes (AGENT_API_URL /health).
-ExecStart=/opt/analyst-agent-monitor/.venv/bin/python serve.py \
+ExecStart=/home/ubuntu/analyst-agent-monitor/.venv/bin/python serve.py \
     --host 127.0.0.1 \
     --port 8766 \
-    --log-file /var/log/cg-sl-api/api.log
+    --log-file /var/log/cg-sl-agent-api/agent.log
 Restart=on-failure
 RestartSec=10
 # Run as a non-privileged user where possible; root is fine for now

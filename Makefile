@@ -1,7 +1,7 @@
 .PHONY: help venv install run run-public install-service uninstall-service test clean
 
 PORT ?= 8766
-LOG_FILE ?= /var/log/cg-sl-api/api.log
+LOG_FILE ?= /var/log/cg-sl-agent-api/agent.log
 # Always the repo's own venv — never the caller's PATH. `make test` used to
 # fail with "python: not found" on Ubuntu because it assumed an activated venv.
 PY := ./.venv/bin/python

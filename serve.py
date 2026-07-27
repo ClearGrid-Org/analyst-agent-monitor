@@ -396,12 +396,27 @@ def fetch_runs(q: dict) -> list[dict]:
                    (r.error is not null or r.status='error')    as errored,
                    exists (select 1 from agent_queries aq
                            where aq.run_id = r.id and aq.query_type='raw_sql') as raw_sql,
+                   -- Reactions are attributed to the EXACT run when the anchor
+                   -- (related_answer) matches this run's answer. Legacy rows
+                   -- without an anchor fall back to the thread's LATEST run —
+                   -- better than the old behavior of smearing one 👎 across
+                   -- every turn in the thread.
                    (select count(*) from feedback fb
                      where fb.thread_ts = r.thread_ts and fb.action='added'
-                       and fb.reaction in {_FB_UP})             as fb_ups,
+                       and fb.reaction in {_FB_UP}
+                       and ((fb.related_answer is not null
+                             and left(fb.related_answer,80) = left(coalesce(r.final_answer,''),80))
+                         or (fb.related_answer is null
+                             and r.ts = (select max(r2.ts) from agent_runs r2
+                                          where r2.thread_ts = r.thread_ts)))) as fb_ups,
                    (select count(*) from feedback fb
                      where fb.thread_ts = r.thread_ts and fb.action='added'
-                       and fb.reaction in {_FB_DOWN})           as fb_downs
+                       and fb.reaction in {_FB_DOWN}
+                       and ((fb.related_answer is not null
+                             and left(fb.related_answer,80) = left(coalesce(r.final_answer,''),80))
+                         or (fb.related_answer is null
+                             and r.ts = (select max(r2.ts) from agent_runs r2
+                                          where r2.thread_ts = r.thread_ts)))) as fb_downs
             from agent_runs r
             where {' and '.join(where)}
             order by r.ts desc

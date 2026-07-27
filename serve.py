@@ -387,6 +387,7 @@ def fetch_runs(q: dict) -> list[dict]:
     return _rows(f"""
         with base as (
             select r.id, r.ts, r.finished_at, r.surface, r.user_name, r.status,
+                   r.thread_ts, r.channel,
                    left(coalesce(r.question,''),110)            as question,
                    round((r.duration_ms/1000.0)::numeric,1)     as duration_sec,
                    coalesce(r.input_tokens,0)+coalesce(r.output_tokens,0) as total_tokens,
@@ -411,6 +412,33 @@ def fetch_runs(q: dict) -> list[dict]:
 
 
 # ═══ RUN DETAIL ══════════════════════════════════════════════════════════
+def fetch_thread(thread_ts: str, channel: str) -> dict:
+    """Everything about one CONVERSATION: transcript + all feedback on it.
+
+    The per-turn stats already live client-side (the runs list); this
+    endpoint supplies what the list doesn't have — the actual back-and-forth
+    and any 👍/👎 + written comments.
+    """
+    res = _parallel(
+        convo=lambda: _rows("""
+            select seq, role, ts, left(content, 1500) as content
+            from conversations where thread_ts = %s and channel = %s
+            order by seq
+        """, (thread_ts, channel)),
+        fb=lambda: _rows("""
+            select ts, user_name, reaction, action, related_answer from feedback
+            where thread_ts = %s order by ts
+        """, (thread_ts,)),
+        fb_text=lambda: _rows("""
+            select ts, user_name, feedback_type, content, related_answer from text_feedback
+            where thread_ts = %s order by ts
+        """, (thread_ts,)),
+    )
+    get = lambda k: [] if isinstance(res.get(k, []), Exception) else res.get(k, [])
+    return _jsonify({"conversation": get("convo"), "feedback": get("fb"),
+                     "feedback_text": get("fb_text")})
+
+
 def fetch_run_detail(run_id: int) -> dict:
     run = _rows(f"""
         select r.*, round(({COST_SQL})::numeric,4) as cost_usd,
@@ -445,13 +473,13 @@ def fetch_run_detail(run_id: int) -> dict:
             order by seq
         """, (r["thread_ts"], r.get("channel") or ""))
         thunks["fb"] = lambda: _rows("""
-            select ts, user_name, reaction, action from feedback
+            select ts, user_name, reaction, action, related_answer from feedback
             where thread_ts = %s order by ts
         """, (r["thread_ts"],))
         # The written explanation lives in a separate table — it's the most
         # valuable part of a 👎, so surface it alongside the reactions.
         thunks["fb_text"] = lambda: _rows("""
-            select ts, user_name, feedback_type, content, related_question
+            select ts, user_name, feedback_type, content, related_answer, related_question
             from text_feedback
             where thread_ts = %s order by ts
         """, (r["thread_ts"],))
@@ -584,6 +612,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(fetch_agent_status(self.log_path))
             elif path == "/api/runs":
                 self._json(fetch_runs(q))
+            elif path == "/api/thread":
+                self._json(fetch_thread((q.get("ts") or [""])[0],
+                                        (q.get("channel") or [""])[0]))
             elif re.fullmatch(r"/api/run/\d+", path):
                 self._json(fetch_run_detail(int(path.rsplit("/", 1)[1])))
             elif path == "/api/quality":
@@ -659,6 +690,10 @@ nav button.active{background:var(--panel2);color:var(--ink);box-shadow:0 1px 2px
 /* ── Layout ── */
 main{padding:18px 24px 32px;max-width:1480px;margin:0 auto}
 .cols{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}
+/* Grid children default to min-width:auto — one unbreakable string (e.g. a
+   no-spaces feedback comment) can blow a column wide and squeeze its sibling.
+   min-width:0 pins each column to its 1fr track no matter the content. */
+.cols>*{min-width:0}
 @media(max-width:1000px){.cols{grid-template-columns:1fr}}
 
 /* ── Stat tiles ── */
@@ -699,6 +734,17 @@ tr.click{cursor:pointer}
 tr.click:hover td{background:var(--accent-soft)}
 .muted{color:var(--dim)} .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 
+/* Conversation grouping in RUNS */
+.grp-h td{background:rgba(255,255,255,.015);font-weight:550}
+.grp-h:hover td{background:var(--accent-soft)}
+.grp-caret{display:inline-block;margin-right:7px;font-size:9px;color:var(--dim);
+           transition:transform .15s ease}
+.grp-caret.open{transform:rotate(90deg)}
+.grp-child td{background:rgba(0,0,0,.14)}
+.grp-child td:first-child{padding-left:18px}
+.grp-indent{display:inline-block;width:10px;border-left:2px solid var(--border);
+            margin-right:8px;height:12px;vertical-align:middle}
+
 /* ── Badges (status → always tinted bg + text label, never color alone) ── */
 .b{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:650;
    letter-spacing:.02em;margin-right:4px;font-variant-numeric:tabular-nums}
@@ -736,6 +782,7 @@ tr.click:hover td{background:var(--accent-soft)}
    color:var(--ink);border-radius:8px;padding:5px 14px;cursor:pointer;font-size:12px;
    transition:border-color .15s}
 .x:hover{border-color:var(--accent)}
+.xback{margin-right:8px;color:var(--accent)}
 
 /* ── Span waterfall — marks: validated llm/tool pair, 1px surface ring ── */
 .wf{margin:2px 0}
@@ -756,6 +803,12 @@ pre{background:var(--inset);border:1px solid var(--border);border-radius:var(--r
 .convo .m{margin:8px 0;padding:8px 12px;border-radius:10px;max-width:92%;font-size:12.5px}
 .convo .u{background:var(--accent-soft);margin-left:auto}
 .convo .a{background:var(--panel2)}
+/* The exact message a reaction was given on */
+.convo .m.flag-down{border:1px solid rgba(229,101,92,.55);box-shadow:0 0 0 3px var(--err-soft)}
+.convo .m.flag-up{border:1px solid rgba(70,192,120,.45)}
+.flag-tag{float:right;font-size:10px;font-weight:650;padding:1px 8px;border-radius:6px;
+          margin-left:10px;background:var(--err-soft);color:var(--err)}
+.flag-up .flag-tag{background:var(--ok-soft);color:var(--ok)}
 
 /* ── Feedback week columns (status semantics: 👍 good / 👎 bad) ── */
 .spark{display:flex;align-items:flex-end;gap:6px;height:64px;padding:8px 4px 4px;
@@ -768,7 +821,8 @@ pre{background:var(--inset);border:1px solid var(--border);border-radius:var(--r
 /* Written feedback — the "what was wrong" text a user typed with their 👎 */
 .fb-note{margin:8px 0 4px;padding:8px 12px;background:var(--inset);
          border-left:2px solid var(--warn);border-radius:0 8px 8px 0}
-.fb-quote{color:var(--ink);font-style:italic;font-size:12.5px;margin-top:2px}
+.fb-quote{color:var(--ink);font-style:italic;font-size:12.5px;margin-top:2px;
+          overflow-wrap:anywhere}
 
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -905,53 +959,200 @@ function hookLog(){
   };
 }
 
-/* ── RUNS ── */
-async function renderRuns(){
+/* ── RUNS ──
+   Two densities of the same data:
+   • grouped (default) — one collapsible header per CONVERSATION with summed
+     cost/tokens and worst-case badges, so one chatty session doesn't bury
+     the list. Expand to see per-turn rows.
+   • flat — every run is a row (the forensic view; used with filters).
+   Runs are still the atomic unit — headers only aggregate, the drawer stays
+   per-run. */
+let runsGrouped = true;
+let lastRuns = [];
+
+function runRow(r, indent){
+  return `
+    <tr class="click ${indent?'grp-child':''}" onclick="openRun(${r.id})">
+      <td class="muted" style="white-space:nowrap">${indent?'<span class="grp-indent"></span>':''}${ago(r.ts)}</td>
+      <td>${esc(r.user_name||'—')} <span class="muted">${r.surface||''}</span></td>
+      <td>${esc(r.question)}</td>
+      <td>
+        ${r.errored?'<span class="b err">error</span>':'<span class="b ok">ok</span>'}
+        ${r.raw_sql?'<span class="b raw">raw-SQL</span>':''}
+        ${r.fb_downs>0?`<span class="b down">👎${r.fb_downs}</span>`:''}
+        ${r.fb_ups>0?`<span class="b up2">👍${r.fb_ups}</span>`:''}
+        ${r.max_turn_reached?'<span class="b mx">max-turns</span>':''}
+      </td>
+      <td class="num">${fmtS(r.duration_sec)}</td>
+      <td class="num">${fmtN(r.total_tokens)}</td>
+      <td class="num">${fmtUsd(r.cost_usd)}</td>
+    </tr>`;
+}
+
+function groupRuns(rows){
+  const groups=new Map();   // key → {runs:[]} — rows arrive newest-first
+  for(const r of rows){
+    const k=r.thread_ts||('run-'+r.id);
+    if(!groups.has(k)) groups.set(k,[]);
+    groups.get(k).push(r);
+  }
+  return [...groups.entries()];  // insertion order = newest thread first
+}
+
+function drawRuns(){
+  const rows=lastRuns;
   const chips=[['','all'],['errors','errors'],['downs','👎'],['raw','raw-SQL'],['slow','slow >60s'],['maxturns','max-turns']];
-  const rows=await J('/api/runs?filter='+runsFilter+'&q='+encodeURIComponent(runsQ));
+  let body='';
+  if(runsGrouped){
+    body=groupRuns(rows).map(([k,g])=>{
+      const first=g[g.length-1];                 // earliest run = the opening question
+      const sum=(f)=>g.reduce((a,r)=>a+Number(r[f]||0),0);
+      const rawN=g.filter(r=>r.raw_sql).length, errN=g.filter(r=>r.errored).length;
+      const downs=sum('fb_downs'), ups=sum('fb_ups');
+      return `
+        <tr class="click grp-h" onclick="openThread('${k}')">
+          <td class="muted" style="white-space:nowrap"><span class="grp-caret">▸</span>${ago(g[0].ts)}</td>
+          <td>${esc(first.user_name||'—')} <span class="muted">${first.surface||''}</span></td>
+          <td>${esc(first.question)} <span class="muted">· ${g.length} turn${g.length>1?'s':''}</span></td>
+          <td>
+            ${errN?`<span class="b err">error${errN>1?' ×'+errN:''}</span>`:''}
+            ${rawN?`<span class="b raw">raw-SQL${rawN>1?' ×'+rawN:''}</span>`:''}
+            ${downs?`<span class="b down">👎${downs}</span>`:''}
+            ${ups?`<span class="b up2">👍${ups}</span>`:''}
+          </td>
+          <td class="num">${fmtS(sum('duration_sec'))}</td>
+          <td class="num">${fmtN(sum('total_tokens'))}</td>
+          <td class="num">${fmtUsd(sum('cost_usd'))}</td>
+        </tr>`;
+    }).join('');
+  } else {
+    body=rows.map(r=>runRow(r,false)).join('');
+  }
   $('#v-runs').innerHTML=`
   <div class="panel">
     <div class="chips">
       ${chips.map(([f,l])=>`<button class="chip ${runsFilter===f?'active':''}" onclick="runsFilter='${f}';refresh(true)">${l}</button>`).join('')}
       <input placeholder="search question… (enter)" value="${esc(runsQ)}"
              onkeydown="if(event.key==='Enter'){runsQ=this.value;refresh(true)}">
+      <span style="flex:1"></span>
+      <button class="chip ${runsGrouped?'active':''}" onclick="runsGrouped=!runsGrouped;drawRuns()"
+              title="Group turns into conversations">${runsGrouped?'☰ grouped':'☰ flat'}</button>
     </div>
     <table>
       <tr><th>when</th><th>user</th><th>question</th><th>badges</th>
           <th class="num">dur</th><th class="num">tokens</th><th class="num">cost</th></tr>
-      ${rows.map(r=>`
-        <tr class="click" onclick="openRun(${r.id})">
-          <td class="muted" style="white-space:nowrap">${ago(r.ts)}</td>
-          <td>${esc(r.user_name||'—')} <span class="muted">${r.surface||''}</span></td>
-          <td>${esc(r.question)}</td>
-          <td>
-            ${r.errored?'<span class="b err">error</span>':'<span class="b ok">ok</span>'}
-            ${r.raw_sql?'<span class="b raw">raw-SQL</span>':''}
-            ${r.fb_downs>0?`<span class="b down">👎${r.fb_downs}</span>`:''}
-            ${r.fb_ups>0?`<span class="b up2">👍${r.fb_ups}</span>`:''}
-            ${r.max_turn_reached?'<span class="b mx">max-turns</span>':''}
-          </td>
-          <td class="num">${fmtS(r.duration_sec)}</td>
-          <td class="num">${fmtN(r.total_tokens)}</td>
-          <td class="num">${fmtUsd(r.cost_usd)}</td>
-        </tr>`).join('')}
+      ${body}
     </table>
     ${rows.length?'':'<div class="muted" style="text-align:center;padding:18px">No runs match.</div>'}
   </div>`;
 }
 
+async function renderRuns(){
+  lastRuns=await J('/api/runs?filter='+runsFilter+'&q='+encodeURIComponent(runsQ));
+  drawRuns();
+}
+
 /* ── RUN DETAIL (drawer) ── */
-async function openRun(id){
+/* Feedback → message anchoring. Reactions store the answer text they were
+   given on (related_answer); match it back to the transcript by prefix so the
+   flagged bubble is visually marked. Content-based on purpose: web messages
+   have no Slack-style id. */
+function fbAnchors(d){
+  const list=[];
+  const isUp=(s)=>/^(\+1|thumbsup|thumbs_up)/.test(s||'');
+  for(const f of (d.feedback||[]))      if(f.related_answer) list.push({p:f.related_answer, up:isUp(f.reaction)});
+  for(const t of (d.feedback_text||[])) if(t.related_answer) list.push({p:t.related_answer, up:(t.feedback_type||'').includes('up')});
+  return list;
+}
+function convoHtml(convo, anchors){
+  return (convo||[]).map(c=>{
+    let cls='', tag='';
+    if(c.role==='assistant' && anchors.length){
+      const pre=(c.content||'').slice(0,120).trim();
+      const hit=anchors.find(a=>{
+        const ap=(a.p||'').slice(0,120).trim();
+        return ap && pre && (pre.startsWith(ap.slice(0,80)) || ap.startsWith(pre.slice(0,80)));
+      });
+      if(hit){ cls=hit.up?' flag-up':' flag-down';
+               tag=`<span class="flag-tag">${hit.up?'👍 praised':'👎 flagged by user'}</span>`; }
+    }
+    return `<div class="m ${c.role==='user'?'u':'a'}${cls}"><span class="muted">${c.role}</span>${tag}<br>${esc(c.content)}</div>`;
+  }).join('')||'<span class="muted">no stored transcript</span>';
+}
+
+/* ── CONVERSATION drawer — click a grouped header to open. Same right-sheet
+   surface as run detail, so the mental model stays "row → drawer". Turns are
+   clickable and drill into run detail with a ← back to the conversation. */
+async function openThread(k){
+  const g=(groupRuns(lastRuns).find(([gk])=>gk===k)||[])[1];
+  if(!g) return;
+  if(!g[0].thread_ts){ openRun(g[0].id); return; }   // no thread → straight to the run
+  window.__threadBack=k;
+  const first=g[g.length-1];
+  const sum=(f)=>g.reduce((a,r)=>a+Number(r[f]||0),0);
+  $('#sheet').innerHTML='<button class="x" onclick="$(\'#detail\').style.display=\'none\'">✕ close</button>'
+    +'<h2 style="margin:4px 0">Conversation</h2><p class="muted">Loading…</p>';
+  $('#detail').style.display='block';
+  const d=await J('/api/thread?ts='+encodeURIComponent(g[0].thread_ts)+'&channel='+encodeURIComponent(g[0].channel||''));
+  $('#sheet').innerHTML=`
+    <button class="x" onclick="$('#detail').style.display='none'">✕ close</button>
+    <h2 style="margin:4px 0 2px">Conversation <span class="muted">· ${esc(first.user_name||'—')} · ${first.surface||''} · started ${ago(first.ts)}</span></h2>
+    <p style="margin:6px 0 10px"><b>${esc(first.question||'')}</b></p>
+    <p class="muted" style="margin:0 0 12px">
+      ${g.length} turns · ${fmtS(sum('duration_sec'))} total · ${fmtN(sum('total_tokens'))} tokens · ${fmtUsd(sum('cost_usd'))}
+    </p>
+    <div class="panel"><h2>Turns <small>— click one for its waterfall + queries</small></h2><div class="bd">
+      <table>
+        <tr><th>when</th><th>question</th><th>badges</th>
+            <th class="num">dur</th><th class="num">tokens</th><th class="num">cost</th></tr>
+        ${[...g].reverse().map(r=>`
+          <tr class="click" onclick="openRun(${r.id},true)">
+            <td class="muted" style="white-space:nowrap">${ago(r.ts)}</td>
+            <td>${esc(r.question)}</td>
+            <td>
+              ${r.errored?'<span class="b err">error</span>':'<span class="b ok">ok</span>'}
+              ${r.raw_sql?'<span class="b raw">raw-SQL</span>':''}
+              ${r.fb_downs>0?`<span class="b down">👎${r.fb_downs}</span>`:''}
+              ${r.fb_ups>0?`<span class="b up2">👍${r.fb_ups}</span>`:''}
+            </td>
+            <td class="num">${fmtS(r.duration_sec)}</td>
+            <td class="num">${fmtN(r.total_tokens)}</td>
+            <td class="num">${fmtUsd(r.cost_usd)}</td>
+          </tr>`).join('')}
+      </table>
+    </div></div>
+    ${(d.feedback.length||d.feedback_text.length)?`
+    <div class="panel"><h2>Feedback</h2><div class="bd">
+      ${d.feedback.length?'<table>'+d.feedback.map(f=>
+        `<tr><td>${ago(f.ts)}</td><td>${esc(f.user_name||'—')}</td>
+         <td><span class="b ${/^(\+1|thumbsup)/.test(f.reaction)?'up2':'down'}">${/^(\+1|thumbsup)/.test(f.reaction)?'👍':'👎'}</span> ${f.action}</td></tr>`).join('')+'</table>':''}
+      ${d.feedback_text.map(t=>`
+        <div class="fb-note">
+          <div class="muted" style="font-size:11px">${ago(t.ts)} · ${esc(t.user_name||'—')} · ${esc(t.feedback_type||'comment')}</div>
+          <div class="fb-quote">“${esc(t.content)}”</div>
+        </div>`).join('')}
+    </div></div>`:''}
+    <div class="panel"><h2>Transcript</h2><div class="bd convo">
+      ${convoHtml(d.conversation, fbAnchors(d))}
+    </div></div>`;
+}
+
+async function openRun(id, fromThread){
+  // Direct opens (runs list, quality, pulse) reset the breadcrumb; only a
+  // click inside the conversation drawer keeps the ← back path.
+  if(!fromThread) window.__threadBack=null;
+  const back = window.__threadBack
+    ? `<button class="x xback" onclick="openThread('${window.__threadBack}')">← conversation</button>` : '';
   // Open instantly with a loading state — perceived speed matters as much as
   // real speed; the data fills in when the fetch lands.
-  $('#sheet').innerHTML='<button class="x" onclick="$(\'#detail\').style.display=\'none\'">✕ close</button>'
+  $('#sheet').innerHTML='<button class="x" onclick="$(\'#detail\').style.display=\'none\'">✕ close</button>'+back
     +'<h2 style="margin:4px 0">Run #'+id+'</h2><p class="muted">Loading…</p>';
   $('#detail').style.display='block';
   const d=await J('/api/run/'+id); const r=d.run||{};
   const total=Math.max(r.duration_ms||1,1);
   let t0=null; if(d.spans.length) t0=new Date(d.spans[0].started_at).getTime();
   $('#sheet').innerHTML=`
-    <button class="x" onclick="$('#detail').style.display='none'">✕ close</button>
+    <button class="x" onclick="$('#detail').style.display='none'">✕ close</button>${back}
     <h2 style="margin:4px 0 2px">Run #${id} <span class="muted">· ${esc(r.user_name||'—')} · ${r.surface||''} · ${ago(r.ts)}</span></h2>
     <p style="margin:6px 0 10px"><b>${esc(r.question||'')}</b></p>
     <p class="muted" style="margin:0 0 12px">
@@ -979,7 +1180,7 @@ async function openRun(id){
     </div></div>`:''}
     <div class="cols">
       <div class="panel"><h2>Conversation</h2><div class="bd convo">
-        ${d.conversation.map(c=>`<div class="m ${c.role==='user'?'u':'a'}"><span class="muted">${c.role}</span><br>${esc(c.content)}</div>`).join('')||'<span class="muted">no thread</span>'}
+        ${convoHtml(d.conversation, fbAnchors(d))}
       </div></div>
       <div class="panel"><h2>Feedback on this thread</h2><div class="bd">
         ${d.feedback.length?'<table>'+d.feedback.map(f=>

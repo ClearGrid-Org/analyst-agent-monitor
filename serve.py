@@ -97,6 +97,35 @@ COST_SQL = (
 _FB_UP   = "('+1','thumbsup','thumbs_up','raised_hands','heart','clap','tada')"
 _FB_DOWN = "('-1','thumbsdown','thumbs_down','x','no_entry','confused')"
 
+# ─── Silent-failure detection ────────────────────────────────────────────
+# The agent's tools RETURN failures as text ("ERROR running `mf query`: …")
+# instead of raising, so core/llm.py persisted the span as status='ok',
+# error=NULL. A hard MetricFlow failure therefore rendered here as a green
+# "ok" badge — invisible to both the error chip and the 30-day taxonomy.
+#
+# The agent side is fixed going forward, but every historical row is still
+# mislabelled. Detect these the only way history allows: by reading the
+# span OUTPUT, which is what the status columns should have reflected.
+_SILENT_ERR = "s.span_type='tool' and s.status='ok' and s.output like 'ERROR%%'"
+
+# A query that returns a header and no data rows. Distinct failure class
+# from an error: the call succeeded, matched nothing, and the agent has
+# reported that as a confident "0" (the PTP 0-vs-5 incident).
+#
+# Two legs, because the marker is new. run_sql has always emitted an
+# explicit "# rows=0" and query_metric now does too — but historical mf
+# spans are bare, rendered by `mf` as nothing but a header line and its
+# dashes separator. The regex recovers those from their shape alone.
+_EMPTY_RES = ("s.span_type='tool' and s.status='ok' and ("
+              "s.output like '%%# rows=0%%' "
+              "or s.output ~ '^[^\n]*\n[-| ]+$')")
+
+# Per-run existence predicates, for use in the runs list / filters.
+RUN_SILENT_ERR = (f"exists (select 1 from agent_spans s "
+                  f"where s.run_id = r.id and {_SILENT_ERR})")
+RUN_EMPTY_RES  = (f"exists (select 1 from agent_spans s "
+                  f"where s.run_id = r.id and {_EMPTY_RES})")
+
 
 # ─── DB helpers ──────────────────────────────────────────────────────────
 # A shared pool: opening a fresh TLS connection to the (remote) Postgres per
@@ -381,6 +410,10 @@ def fetch_runs(q: dict) -> list[dict]:
         having = "where raw_sql"
     elif f == "downs":
         having = "where fb_downs > 0"
+    elif f == "silent":
+        having = "where silent_err"
+    elif f == "empty":
+        having = "where empty_res"
 
     limit = min(int((q.get("limit") or ["100"])[0]), 500)
     params_all = tuple(params) + (limit,)
@@ -394,6 +427,8 @@ def fetch_runs(q: dict) -> list[dict]:
                    round(({COST_SQL})::numeric, 4)              as cost_usd,
                    r.max_turn_reached,
                    (r.error is not null or r.status='error')    as errored,
+                   {RUN_SILENT_ERR}                            as silent_err,
+                   {RUN_EMPTY_RES}                             as empty_res,
                    exists (select 1 from agent_queries aq
                            where aq.run_id = r.id and aq.query_type='raw_sql') as raw_sql,
                    -- Reactions are attributed to the EXACT run when the anchor
@@ -528,11 +563,26 @@ def fetch_quality() -> dict:
             where q.query_type = 'raw_sql'
             order by q.ts desc limit 20
         """),
-        error_taxonomy=lambda: _rows("""
-            select left(coalesce(error,''),90) as error_head, count(*) as n, max(ts) as last_seen
-            from agent_runs
-            where error is not null and ts > now() - interval '30 days'
-            group by 1 order by n desc limit 10
+        # Run-level errors UNION tool-level silent failures. Without the
+        # second leg this table read "No errors in 30 days" while 550 tool
+        # calls had failed — the failures never reached agent_runs.error
+        # because the tools return them as text instead of raising.
+        error_taxonomy=lambda: _rows(f"""
+            select error_head, sum(n) as n, max(last_seen) as last_seen, kind from (
+                select left(coalesce(error,''),90) as error_head, count(*) as n,
+                       max(ts) as last_seen, 'run' as kind
+                from agent_runs
+                where error is not null and ts > now() - interval '30 days'
+                group by 1
+                union all
+                select left(split_part(s.output, chr(10), 1), 90) as error_head,
+                       count(*) as n, max(s.started_at) as last_seen,
+                       'tool: ' || s.span_name as kind
+                from agent_spans s
+                where {_SILENT_ERR} and s.started_at > now() - interval '30 days'
+                group by 1, 4
+            ) u
+            group by error_head, kind order by n desc limit 12
         """),
         slow_tools=lambda: _rows("""
             select span_name, count(*) as calls,
@@ -798,6 +848,10 @@ tr.click:hover td{background:var(--accent-soft)}
    transition:border-color .15s}
 .x:hover{border-color:var(--accent)}
 .xback{margin-right:8px;color:var(--accent)}
+.cid{background:var(--inset);border:1px solid var(--border);border-radius:6px;
+     padding:2px 8px;margin-left:6px;cursor:pointer;color:var(--muted);
+     font:11px ui-monospace,Menlo,monospace;user-select:all}
+.cid:hover{border-color:var(--accent);color:var(--ink)}
 
 /* ── Span waterfall — marks: validated llm/tool pair, 1px surface ring ── */
 .wf{margin:2px 0}
@@ -866,6 +920,20 @@ pre{background:var(--inset);border:1px solid var(--border);border-radius:var(--r
 const $ = s => document.querySelector(s);
 const esc = s => (s??'').toString().replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmtN = v => v==null?'—':Number(v).toLocaleString();
+
+/* A run's real outcome. `errored` alone used to decide this, which showed a
+   green "ok" for runs whose tools failed — the tools return errors as text
+   rather than raising, so the run row never learned about it. A silent fail
+   is as bad as an error and reads as one; an empty result is a softer signal
+   (the query worked, matched nothing) that the agent has misreported as 0. */
+function statusBadges(r){
+  const out = [];
+  if (r.errored)        out.push('<span class="b err">error</span>');
+  else if (r.silent_err) out.push('<span class="b err">silent fail</span>');
+  else                   out.push('<span class="b ok">ok</span>');
+  if (r.empty_res)      out.push('<span class="b raw" title="A query returned zero rows — check the agent did not report it as 0">empty result</span>');
+  return out.join(' ');
+}
 const fmtUsd = v => v==null?'—':'$'+Number(v).toFixed(Number(v)<1?4:2);
 const fmtGB = b => b==null?'—':(b/1e9).toFixed(2)+' GB';
 const fmtS = v => v==null?'—':Number(v).toFixed(1)+'s';
@@ -873,6 +941,14 @@ const ago = iso => { if(!iso) return '—'; const s=(Date.now()-new Date(iso))/1
   if(s<60)return s.toFixed(0)+'s ago'; if(s<3600)return (s/60).toFixed(0)+'m ago';
   if(s<86400)return (s/3600).toFixed(1)+'h ago'; return (s/86400).toFixed(1)+'d ago'; };
 const J = async p => { const r = await fetch(p); return r.json(); };
+// Copy a conversation id to the clipboard (for pasting into a ticket/chat).
+function copyId(id, el){
+  const done = () => { const o = el.textContent; el.textContent = 'copied ✓';
+                       setTimeout(() => { el.textContent = o; }, 1200); };
+  if (navigator.clipboard) navigator.clipboard.writeText(id).then(done).catch(done);
+  else { const t = document.createElement('textarea'); t.value = id;
+         document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); done(); }
+}
 
 let view='pulse', runsFilter='', runsQ='';
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
@@ -992,7 +1068,7 @@ function runRow(r, indent){
       <td>${esc(r.user_name||'—')} <span class="muted">${r.surface||''}</span></td>
       <td>${esc(r.question)}</td>
       <td>
-        ${r.errored?'<span class="b err">error</span>':'<span class="b ok">ok</span>'}
+        ${statusBadges(r)}
         ${r.raw_sql?'<span class="b raw">raw-SQL</span>':''}
         ${r.fb_downs>0?`<span class="b down">👎${r.fb_downs}</span>`:''}
         ${r.fb_ups>0?`<span class="b up2">👍${r.fb_ups}</span>`:''}
@@ -1016,7 +1092,7 @@ function groupRuns(rows){
 
 function drawRuns(){
   const rows=lastRuns;
-  const chips=[['','all'],['errors','errors'],['downs','👎'],['raw','raw-SQL'],['slow','slow >60s'],['maxturns','max-turns']];
+  const chips=[['','all'],['errors','errors'],['silent','silent fails'],['empty','empty results'],['downs','👎'],['raw','raw-SQL'],['slow','slow >60s'],['maxturns','max-turns']];
   let body='';
   if(runsGrouped){
     body=groupRuns(rows).map(([k,g])=>{
@@ -1113,8 +1189,13 @@ async function openThread(k){
     <button class="x" onclick="$('#detail').style.display='none'">✕ close</button>
     <h2 style="margin:4px 0 2px">Conversation <span class="muted">· ${esc(first.user_name||'—')} · ${first.surface||''} · started ${ago(first.ts)}</span></h2>
     <p style="margin:6px 0 10px"><b>${esc(first.question||'')}</b></p>
-    <p class="muted" style="margin:0 0 12px">
+    <p class="muted" style="margin:0 0 8px">
       ${g.length} turns · ${fmtS(sum('duration_sec'))} total · ${fmtN(sum('total_tokens'))} tokens · ${fmtUsd(sum('cost_usd'))}
+    </p>
+    <p class="muted" style="margin:0 0 14px;font-size:11.5px">
+      conversation id
+      <code class="cid" title="click to copy"
+            onclick="copyId('${g[0].thread_ts}', this)">${esc(g[0].thread_ts)}</code>
     </p>
     <div class="panel"><h2>Turns <small>— click one for its waterfall + queries</small></h2><div class="bd">
       <table>
@@ -1125,7 +1206,7 @@ async function openThread(k){
             <td class="muted" style="white-space:nowrap">${ago(r.ts)}</td>
             <td>${esc(r.question)}</td>
             <td>
-              ${r.errored?'<span class="b err">error</span>':'<span class="b ok">ok</span>'}
+              ${statusBadges(r)}
               ${r.raw_sql?'<span class="b raw">raw-SQL</span>':''}
               ${r.fb_downs>0?`<span class="b down">👎${r.fb_downs}</span>`:''}
               ${r.fb_ups>0?`<span class="b up2">👍${r.fb_ups}</span>`:''}
@@ -1231,7 +1312,8 @@ async function renderQuality(){
       </div></div>
       <div class="panel"><h2>Error taxonomy (30d)</h2><div class="bd">
         ${d.error_taxonomy.length?'<table>'+d.error_taxonomy.map(e=>
-          `<tr><td class="num" style="width:36px">${e.n}×</td><td>${esc(e.error_head)}</td>
+          `<tr><td class="num" style="width:36px">${e.n}×</td>
+           <td>${esc(e.error_head)}<br><span class="muted" style="font-size:10px">${esc(e.kind)}</span></td>
            <td class="muted num">${ago(e.last_seen)}</td></tr>`).join('')+'</table>'
         :'<div class="muted" style="padding:10px">No errors in 30 days.</div>'}
         <p class="muted" style="margin:6px 2px">max-turns hit ${d.maxturns}× this week</p>

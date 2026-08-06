@@ -126,6 +126,16 @@ RUN_SILENT_ERR = (f"exists (select 1 from agent_spans s "
 RUN_EMPTY_RES  = (f"exists (select 1 from agent_spans s "
                   f"where s.run_id = r.id and {_EMPTY_RES})")
 
+# An answer whose footer CLAIMS a data source while the run made zero data
+# queries — i.e. a fabricated citation. Run 541 answered "1,009,854 borrowers
+# … _source: semantic-layer_" from a single LLM call with no tool use; the
+# real figure was 510,056. The claim is checkable mechanically: the source
+# footer names a tool path, agent_queries records what actually ran. Zero
+# rows + a source claim = the numbers came from nowhere.
+RUN_UNCITED = ("(r.final_answer ~* 'source:\\s*(semantic.layer|raw.exploration|mixed)' "
+               "and not exists (select 1 from agent_queries aq2 "
+               "where aq2.run_id = r.id))")
+
 
 # ─── DB helpers ──────────────────────────────────────────────────────────
 # A shared pool: opening a fresh TLS connection to the (remote) Postgres per
@@ -414,6 +424,8 @@ def fetch_runs(q: dict) -> list[dict]:
         having = "where silent_err"
     elif f == "empty":
         having = "where empty_res"
+    elif f == "uncited":
+        having = "where uncited"
 
     limit = min(int((q.get("limit") or ["100"])[0]), 500)
     params_all = tuple(params) + (limit,)
@@ -429,6 +441,7 @@ def fetch_runs(q: dict) -> list[dict]:
                    (r.error is not null or r.status='error')    as errored,
                    {RUN_SILENT_ERR}                            as silent_err,
                    {RUN_EMPTY_RES}                             as empty_res,
+                   {RUN_UNCITED}                               as uncited,
                    exists (select 1 from agent_queries aq
                            where aq.run_id = r.id and aq.query_type='raw_sql') as raw_sql,
                    -- Reactions are attributed to the EXACT run when the anchor
@@ -932,6 +945,7 @@ function statusBadges(r){
   else if (r.silent_err) out.push('<span class="b err">silent fail</span>');
   else                   out.push('<span class="b ok">ok</span>');
   if (r.empty_res)      out.push('<span class="b raw" title="A query returned zero rows — check the agent did not report it as 0">empty result</span>');
+  if (r.uncited)        out.push('<span class="b err" title="Answer claims a data source but the run made ZERO data queries — the numbers are unverifiable and possibly invented">uncited</span>');
   return out.join(' ');
 }
 const fmtUsd = v => v==null?'—':'$'+Number(v).toFixed(Number(v)<1?4:2);
@@ -1092,7 +1106,7 @@ function groupRuns(rows){
 
 function drawRuns(){
   const rows=lastRuns;
-  const chips=[['','all'],['errors','errors'],['silent','silent fails'],['empty','empty results'],['downs','👎'],['raw','raw-SQL'],['slow','slow >60s'],['maxturns','max-turns']];
+  const chips=[['','all'],['errors','errors'],['silent','silent fails'],['empty','empty results'],['uncited','uncited numbers'],['downs','👎'],['raw','raw-SQL'],['slow','slow >60s'],['maxturns','max-turns']];
   let body='';
   if(runsGrouped){
     body=groupRuns(rows).map(([k,g])=>{

@@ -80,17 +80,51 @@ DB_SSLMODE  = _env("DB_SSLMODE", "prefer").strip()
 
 # ─── Cost model ──────────────────────────────────────────────────────────
 # The DB stores token counters, not dollars. USD per MILLION tokens.
-# Default = claude-sonnet-4-5. Override via env if the agent model changes.
-PRICE_IN        = float(_env("PRICE_INPUT_PER_M",       "3.0"))
+#
+# Prices are PER MODEL FAMILY, matched against agent_runs.model. Flat
+# constants were correct while every run used one model; once priority users
+# were routed to Opus (see AGENT_PRIORITY_MODEL in the agent's .env), a flat
+# Sonnet rate under-reported their spend by ~1.7x — exactly the users who
+# also have no token budget and no BigQuery ceiling.
+#
+# Cache multipliers are derived, not guessed: cache WRITE is 1.25x base input
+# at the default 5-minute TTL (2x at 1h — not modelled; the agent doesn't set
+# a TTL), cache READ is 0.1x base input.
+PRICE_IN        = float(_env("PRICE_INPUT_PER_M",       "3.0"))   # sonnet default
 PRICE_OUT       = float(_env("PRICE_OUTPUT_PER_M",      "15.0"))
 PRICE_CACHE_W   = float(_env("PRICE_CACHE_WRITE_PER_M", "3.75"))
 PRICE_CACHE_R   = float(_env("PRICE_CACHE_READ_PER_M",  "0.30"))
 
+# family → {in, out, cache_w, cache_r}. The env-configurable Sonnet row is the
+# ELSE branch, so an unrecognised or NULL model still costs at the old rate
+# rather than silently costing zero.
+MODEL_PRICES = {
+    "opus":  {"in": 5.0, "out": 25.0, "cache_w": 6.25, "cache_r": 0.50},
+    "haiku": {"in": 1.0, "out":  5.0, "cache_w": 1.25, "cache_r": 0.10},
+}
+_DEFAULT_PRICE = {
+    "in": PRICE_IN, "out": PRICE_OUT,
+    "cache_w": PRICE_CACHE_W, "cache_r": PRICE_CACHE_R,
+}
+
+
+def _price_case(key: str) -> str:
+    """SQL CASE picking one price dimension from agent_runs.model."""
+    branches = " ".join(
+        f"when model ilike '%%{family}%%' then {prices[key]}"
+        for family, prices in MODEL_PRICES.items()
+    )
+    return f"(case {branches} else {_DEFAULT_PRICE[key]} end)"
+
+
 # SQL fragment computing a run's cost from agent_runs token columns.
+# Requires `model` to be in scope alongside the token columns — true at every
+# call site (all select from agent_runs, directly or via `select *`).
 COST_SQL = (
-    f"(coalesce(input_tokens,0)*{PRICE_IN} + coalesce(output_tokens,0)*{PRICE_OUT}"
-    f" + coalesce(cache_creation_input_tokens,0)*{PRICE_CACHE_W}"
-    f" + coalesce(cache_read_input_tokens,0)*{PRICE_CACHE_R}) / 1e6"
+    f"(coalesce(input_tokens,0)*{_price_case('in')}"
+    f" + coalesce(output_tokens,0)*{_price_case('out')}"
+    f" + coalesce(cache_creation_input_tokens,0)*{_price_case('cache_w')}"
+    f" + coalesce(cache_read_input_tokens,0)*{_price_case('cache_r')}) / 1e6"
 )
 
 # Feedback reactions → sentiment. Slack emoji names vary; be permissive.
@@ -432,7 +466,7 @@ def fetch_runs(q: dict) -> list[dict]:
     return _rows(f"""
         with base as (
             select r.id, r.ts, r.finished_at, r.surface, r.user_name, r.status,
-                   r.thread_ts, r.channel,
+                   r.thread_ts, r.channel, r.model,
                    left(coalesce(r.question,''),110)            as question,
                    round((r.duration_ms/1000.0)::numeric,1)     as duration_sec,
                    coalesce(r.input_tokens,0)+coalesce(r.output_tokens,0) as total_tokens,
@@ -832,6 +866,12 @@ tr.click:hover td{background:var(--accent-soft)}
 .b.down{background:var(--err-soft);color:var(--err)}
 .b.up2{background:var(--ok-soft);color:var(--ok)}
 .b.mx{background:var(--accent-soft);color:var(--accent)}
+/* Model chips: neutral, not a status — a run on Opus isn't better or
+   worse, just costlier. Deliberately quieter than the error/feedback
+   badges so it doesn't compete with them for attention. */
+.b.mdl-opus{background:var(--panel-2);color:var(--muted);border:1px solid var(--border)}
+.b.mdl-haiku{background:var(--panel-2);color:var(--muted);border:1px solid var(--border)}
+.mdl-name{font-variant-numeric:tabular-nums;opacity:.85}
 
 /* ── Filter chips ── */
 .chips{display:flex;gap:7px;flex-wrap:wrap;align-items:center;padding:12px 16px}
@@ -939,6 +979,19 @@ const fmtN = v => v==null?'—':Number(v).toLocaleString();
    rather than raising, so the run row never learned about it. A silent fail
    is as bad as an error and reads as one; an empty result is a softer signal
    (the query worked, matched nothing) that the agent has misreported as 0. */
+// Which model answered. Runs are no longer single-model (priority users are
+// routed to Opus), and the cost column now prices per family — so the model
+// has to be visible or a 5x cost difference between two adjacent rows looks
+// like a bug. Only non-default families get a chip: tagging every Sonnet run
+// would be noise, and the absence of a chip is itself the signal.
+function modelChip(model){
+  if(!model) return '';
+  const m = String(model).toLowerCase();
+  if(m.includes('opus'))  return `<span class="b mdl-opus"  title="${esc(model)}">opus</span>`;
+  if(m.includes('haiku')) return `<span class="b mdl-haiku" title="${esc(model)}">haiku</span>`;
+  return '';  // sonnet / default — no chip
+}
+
 function statusBadges(r){
   const out = [];
   if (r.errored)        out.push('<span class="b err">error</span>');
@@ -1083,6 +1136,7 @@ function runRow(r, indent){
       <td>${esc(r.question)}</td>
       <td>
         ${statusBadges(r)}
+        ${modelChip(r.model)}
         ${r.raw_sql?'<span class="b raw">raw-SQL</span>':''}
         ${r.fb_downs>0?`<span class="b down">👎${r.fb_downs}</span>`:''}
         ${r.fb_ups>0?`<span class="b up2">👍${r.fb_ups}</span>`:''}
@@ -1121,6 +1175,7 @@ function drawRuns(){
           <td>${esc(first.question)} <span class="muted">· ${g.length} turn${g.length>1?'s':''}</span></td>
           <td>
             ${errN?`<span class="b err">error${errN>1?' ×'+errN:''}</span>`:''}
+            ${[...new Set(g.map(r=>r.model).filter(Boolean))].map(modelChip).join('')}
             ${rawN?`<span class="b raw">raw-SQL${rawN>1?' ×'+rawN:''}</span>`:''}
             ${downs?`<span class="b down">👎${downs}</span>`:''}
             ${ups?`<span class="b up2">👍${ups}</span>`:''}
@@ -1221,6 +1276,7 @@ async function openThread(k){
             <td>${esc(r.question)}</td>
             <td>
               ${statusBadges(r)}
+              ${modelChip(r.model)}
               ${r.raw_sql?'<span class="b raw">raw-SQL</span>':''}
               ${r.fb_downs>0?`<span class="b down">👎${r.fb_downs}</span>`:''}
               ${r.fb_ups>0?`<span class="b up2">👍${r.fb_ups}</span>`:''}
@@ -1269,6 +1325,7 @@ async function openRun(id, fromThread){
       ${fmtS(r.duration_ms/1000)} · ${fmtN((r.input_tokens||0)+(r.output_tokens||0))} tokens
       (cache read ${fmtN(r.cache_read_input_tokens)}) · ${fmtUsd(r.cost_usd)} ·
       ${r.turn_count||0} turns · ${r.tool_calls_count||0} tool calls
+      · <span class="mdl-name">${esc(r.model||'model unknown')}</span>
       ${r.error?`<br><span style="color:var(--err)">error: ${esc(r.error)}</span>`:''}
     </p>
     <div class="panel"><h2>Span waterfall</h2><div class="bd wf">
